@@ -9,10 +9,11 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, Optional
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -28,8 +29,9 @@ MQTT_HOST = os.getenv("MQTT_HOST", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 SENSOR_TOPIC = "portedge/sensors/#"
-WINDOW_SIZE = 30          # samples per sensor for anomaly window
+WINDOW_SIZE = 30
 ANOMALY_CONTAMINATION = 0.08
+RECONNECT_DELAY = 5
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
@@ -54,7 +56,7 @@ class Alert(BaseModel):
     id: str
     sensor_id: str
     sensor_type: str
-    severity: str          # low / medium / high / critical
+    severity: str
     message: str
     value: float
     timestamp: str
@@ -68,10 +70,11 @@ class HealthResponse(BaseModel):
     sensors_seen: int
     total_readings: int
     active_alerts: int
+    version: str = "0.2.0"
 
 
 # ---------------------------------------------------------------------------
-# Edge state (in-memory for demonstration)
+# Edge state (thread-safe)
 # ---------------------------------------------------------------------------
 class EdgeState:
     def __init__(self):
@@ -82,7 +85,7 @@ class EdgeState:
         self.alerts: Deque[Alert] = deque(maxlen=200)
         self.total_readings = 0
         self.models: Dict[str, IsolationForest] = {}
-        self.lock = asyncio.Lock()
+        self._lock = threading.Lock()  # used from MQTT thread + asyncio
 
     def get_or_create_model(self, sensor_id: str) -> IsolationForest:
         if sensor_id not in self.models:
@@ -96,14 +99,15 @@ class EdgeState:
 
 state = EdgeState()
 
+# Global event loop reference for safe scheduling from MQTT thread
+_main_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
 # ---------------------------------------------------------------------------
 # Anomaly detection (edge AI)
 # ---------------------------------------------------------------------------
 def detect_anomaly(sensor_id: str, value: float) -> Optional[float]:
-    """
-    Lightweight statistical + IsolationForest anomaly score.
-    Returns anomaly score (higher = more anomalous) or None if not enough data.
-    """
+    """Lightweight statistical + IsolationForest anomaly score."""
     window = state.readings[sensor_id]
     window.append(value)
 
@@ -113,8 +117,7 @@ def detect_anomaly(sensor_id: str, value: float) -> Optional[float]:
     data = np.array(window).reshape(-1, 1)
     model = state.get_or_create_model(sensor_id)
 
-    # Fit only occasionally to keep edge CPU light
-    if len(window) % 5 == 0 or sensor_id not in state.models:
+    if len(window) % 5 == 0:
         try:
             model.fit(data)
         except Exception as e:
@@ -122,18 +125,15 @@ def detect_anomaly(sensor_id: str, value: float) -> Optional[float]:
             return None
 
     try:
-        # decision_function: negative = anomaly
         score = -model.decision_function([[value]])[0]
         return float(score)
     except Exception:
-        # Fallback pure statistical
-        mean = np.mean(data)
-        std = np.std(data) + 1e-6
-        z = abs(value - mean) / std
-        return float(z)
+        mean = float(np.mean(data))
+        std = float(np.std(data)) + 1e-6
+        return abs(value - mean) / std
 
 
-def severity_from_score(score: float, sensor_type: str) -> str:
+def severity_from_score(score: float) -> str:
     if score > 3.5:
         return "critical"
     if score > 2.5:
@@ -143,8 +143,34 @@ def severity_from_score(score: float, sensor_type: str) -> str:
     return "low"
 
 
+def process_reading_sync(reading: SensorReading) -> None:
+    """Process a reading safely from any thread."""
+    with state._lock:
+        state.latest[reading.sensor_id] = reading
+        state.total_readings += 1
+
+        score = detect_anomaly(reading.sensor_id, reading.value)
+        if score is not None and score > 1.5:
+            sev = severity_from_score(score)
+            alert = Alert(
+                id=f"{reading.sensor_id}-{int(time.time() * 1000)}",
+                sensor_id=reading.sensor_id,
+                sensor_type=reading.sensor_type,
+                severity=sev,
+                message=(
+                    f"Anomalous {reading.sensor_type} reading: "
+                    f"{reading.value:.2f} {reading.unit} (score={score:.2f})"
+                ),
+                value=reading.value,
+                timestamp=reading.timestamp,
+                score=score,
+            )
+            state.alerts.appendleft(alert)
+            logger.warning(f"ALERT [{sev.upper()}] {alert.message}")
+
+
 # ---------------------------------------------------------------------------
-# MQTT callbacks
+# MQTT callbacks (run in paho thread)
 # ---------------------------------------------------------------------------
 def on_connect(client, userdata, flags, reason_code, properties=None):
     if reason_code == 0:
@@ -159,44 +185,16 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
 
 def on_disconnect(client, userdata, reason_code, properties=None):
     state.mqtt_connected = False
-    logger.warning(f"Disconnected from MQTT (code={reason_code})")
+    logger.warning(f"Disconnected from MQTT (code={reason_code}). Will attempt reconnect...")
 
 
 def on_message(client, userdata, msg):
     try:
         payload = json.loads(msg.payload.decode())
         reading = SensorReading(**payload)
-        # Schedule the async processing
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(process_reading(reading))
-        except RuntimeError:
-            # Fallback if no running loop
-            asyncio.run(process_reading(reading))
+        process_reading_sync(reading)
     except Exception as e:
         logger.error(f"Failed to process message on {msg.topic}: {e}")
-
-
-async def process_reading(reading: SensorReading):
-    async with state.lock:
-        state.latest[reading.sensor_id] = reading
-        state.total_readings += 1
-
-        score = detect_anomaly(reading.sensor_id, reading.value)
-        if score is not None and score > 1.5:
-            sev = severity_from_score(score, reading.sensor_type)
-            alert = Alert(
-                id=f"{reading.sensor_id}-{int(time.time()*1000)}",
-                sensor_id=reading.sensor_id,
-                sensor_type=reading.sensor_type,
-                severity=sev,
-                message=f"Anomalous {reading.sensor_type} reading: {reading.value:.2f} {reading.unit} (score={score:.2f})",
-                value=reading.value,
-                timestamp=reading.timestamp,
-                score=score,
-            )
-            state.alerts.appendleft(alert)
-            logger.warning(f"ALERT [{sev.upper()}] {alert.message}")
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +203,7 @@ async def process_reading(reading: SensorReading):
 app = FastAPI(
     title="PortEdge Edge Gateway",
     description="Real-time edge processing for smart port IoT sensors",
-    version="0.1.0",
+    version="0.2.0",
 )
 
 app.add_middleware(
@@ -218,24 +216,38 @@ app.add_middleware(
 mqtt_client: Optional[mqtt.Client] = None
 
 
-@app.on_event("startup")
-async def startup():
-    global mqtt_client
-    logger.info("Starting PortEdge Edge Gateway...")
-
-    mqtt_client = mqtt.Client(
+def _create_mqtt_client() -> mqtt.Client:
+    client = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
         client_id="portedge-edge-gateway",
     )
-    mqtt_client.on_connect = on_connect
-    mqtt_client.on_disconnect = on_disconnect
-    mqtt_client.on_message = on_message
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message = on_message
+    client.reconnect_delay_set(min_delay=1, max_delay=30)
+    return client
 
-    try:
-        mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
-        mqtt_client.loop_start()
-    except Exception as e:
-        logger.error(f"Could not connect to MQTT: {e}")
+
+@app.on_event("startup")
+async def startup():
+    global mqtt_client, _main_loop
+    _main_loop = asyncio.get_running_loop()
+    logger.info("Starting PortEdge Edge Gateway v0.2.0...")
+
+    mqtt_client = _create_mqtt_client()
+
+    # Retry connection with backoff
+    for attempt in range(1, 13):
+        try:
+            mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+            mqtt_client.loop_start()
+            logger.info("MQTT loop started")
+            break
+        except Exception as e:
+            logger.warning(f"MQTT connect attempt {attempt}/12 failed: {e}")
+            await asyncio.sleep(RECONNECT_DELAY)
+    else:
+        logger.error("Could not connect to MQTT after multiple attempts")
 
 
 @app.on_event("shutdown")
@@ -263,9 +275,8 @@ async def health():
 
 @app.get("/sensors")
 async def list_sensors():
-    return {
-        "count": len(state.latest),
-        "sensors": [
+    with state._lock:
+        sensors = [
             {
                 "sensor_id": r.sensor_id,
                 "type": r.sensor_type,
@@ -275,47 +286,46 @@ async def list_sensors():
                 "location": r.location,
             }
             for r in state.latest.values()
-        ],
-    }
+        ]
+    return {"count": len(sensors), "sensors": sensors}
 
 
 @app.get("/sensors/{sensor_id}")
 async def get_sensor(sensor_id: str):
-    if sensor_id not in state.latest:
-        return {"error": "sensor not found"}
-    r = state.latest[sensor_id]
-    return r.model_dump()
+    with state._lock:
+        if sensor_id not in state.latest:
+            return {"error": "sensor not found"}
+        return state.latest[sensor_id].model_dump()
 
 
 @app.get("/alerts")
 async def get_alerts(limit: int = 50):
-    return {
-        "count": len(state.alerts),
-        "alerts": [a.model_dump() for a in list(state.alerts)[:limit]],
-    }
+    with state._lock:
+        alerts = [a.model_dump() for a in list(state.alerts)[:limit]]
+    return {"count": len(alerts), "alerts": alerts}
 
 
 @app.get("/")
 async def root():
     return {
         "service": "PortEdge Edge Gateway",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "docs": "/docs",
         "health": "/health",
     }
 
 
-# Simple WebSocket for live updates (demo)
 @app.websocket("/ws/live")
 async def websocket_live(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            payload = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "sensors": {k: v.model_dump() for k, v in state.latest.items()},
-                "alerts": [a.model_dump() for a in list(state.alerts)[:10]],
-            }
+            with state._lock:
+                payload = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "sensors": {k: v.model_dump() for k, v in state.latest.items()},
+                    "alerts": [a.model_dump() for a in list(state.alerts)[:10]],
+                }
             await websocket.send_json(payload)
             await asyncio.sleep(2)
     except WebSocketDisconnect:
