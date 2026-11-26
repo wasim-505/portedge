@@ -6,7 +6,7 @@ Real-time view of edge gateway sensors and alerts.
 
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 import pandas as pd
@@ -29,6 +29,10 @@ st.caption("Real-time monitoring for Jeddah Islamic Port style operations · Com
 st.sidebar.header("Controls")
 refresh_rate = st.sidebar.slider("Refresh interval (seconds)", 2, 15, 4)
 auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("**PortEdge v0.2**")
+st.sidebar.markdown("Edge Computing · MQTT · Anomaly Detection")
 
 # Fetch helpers
 @st.cache_data(ttl=2)
@@ -134,9 +138,9 @@ with right:
         st.success("No active alerts — system nominal")
 
 # Footer
+now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 st.caption(
-    f"Last update: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC · "
-    f"Gateway: {GATEWAY_URL} · PortEdge v0.1"
+    f"Last update: {now} UTC · Gateway: {GATEWAY_URL} · PortEdge v0.2"
 )
 
 if auto_refresh:
