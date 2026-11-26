@@ -1,20 +1,21 @@
 # PortEdge — Edge Computing Platform for Smart Port Operations
 
-**Computer Engineering Portfolio Project**  
+**Computer Engineering Portfolio Project · v0.2**  
 Designed for real-world logistics environments such as **Jeddah Islamic Port** and Saudi Vision 2030 smart logistics initiatives.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
 ![Docker](https://img.shields.io/badge/docker-ready-blue.svg)
 ![MQTT](https://img.shields.io/badge/protocol-MQTT-green.svg)
+![Version](https://img.shields.io/badge/version-0.2.0-orange.svg)
 
 PortEdge is a complete **edge-to-cloud** simulation and monitoring platform that demonstrates core Computer Engineering skills:
 
 - Real-time systems & concurrent data processing
-- IoT protocols (MQTT with QoS)
-- Edge AI / lightweight anomaly detection
+- IoT protocols (MQTT with QoS + automatic reconnection)
+- Edge AI / lightweight anomaly detection (Isolation Forest + statistical)
 - Sensor data pipelines & digital twins
-- Networked systems design
+- Networked systems design & thread-safe state management
 - Containerized microservices
 - Observability & reliability patterns
 
@@ -31,8 +32,8 @@ PortEdge shows you can:
 - Design reliable real-time data paths
 - Run intelligence close to the data source (edge)
 - Handle unreliable networks and constrained devices
-- Integrate computer vision concepts for cargo inspection
-- Build production-grade observability
+- Build production-grade observability and health checks
+- Apply ML in resource-aware environments
 
 ---
 
@@ -41,16 +42,16 @@ PortEdge shows you can:
 ```
 ┌─────────────────┐     MQTT      ┌──────────────────────┐
 │ Sensor          │ ─────────────► │   Edge Gateway       │
-│ Simulators      │   (QoS 1)     │  - Rule engine       │
+│ Simulators      │   (QoS 1)     │  - Thread-safe state │
 │ (Temp, Vib,     │               │  - Anomaly detection │
-│  GPS, Door...)  │               │  - Local buffer      │
+│  GPS, Door...)  │               │  - Auto-reconnect   │
 └─────────────────┘               │  - Health checks     │
                                   └──────────┬───────────┘
                                              │ REST / WebSocket
-┌─────────────────┐                          ▼
-│ Computer Vision │               ┌──────────────────────┐
-│ (Cargo Inspect) │◄──────────────│   Dashboard + API    │
-└─────────────────┘               │  - Real-time view    │
+                                             ▼
+                                  ┌──────────────────────┐
+                                  │   Dashboard + API    │
+                                  │  - Real-time view    │
                                   │  - Alerts            │
                                   │  - Metrics           │
                                   └──────────────────────┘
@@ -59,19 +60,19 @@ PortEdge shows you can:
 **Key design decisions (Computer Engineering focus):**
 - Edge-first processing (reduce cloud dependency & latency)
 - MQTT for lightweight, reliable messaging under constrained bandwidth
-- Stateless + local state hybrid for resilience
+- Thread-safe shared state between MQTT callback thread and FastAPI
+- Automatic reconnection with backoff
 - Clear separation of concerns between simulation, edge logic, and presentation
 
 ---
 
-## Features
+## Features (v0.2)
 
-- **Multi-sensor digital twin** — Container temperature (reefer), vibration (crane/yard equipment), GPS, door status, humidity
-- **Edge Gateway** — Receives MQTT messages, runs lightweight anomaly detection (statistical + Isolation Forest style), buffers data, exposes REST API
-- **Real-time Dashboard** — Live metrics, alerts, sensor health
-- **Computer Vision placeholder** — Simulated cargo damage / seal inspection pipeline
+- **Multi-sensor digital twin** — Reefer temperature, crane vibration, humidity, door status, electric tractor speed (Jeddah-inspired IDs)
+- **Edge Gateway** — MQTT consumer with QoS 1, sliding-window buffering, IsolationForest + z-score anomaly detection, thread-safe state, REST + WebSocket APIs
+- **Real-time Dashboard** — Live metrics, alerts, sensor table and charts
+- **Robustness** — Connection retry with backoff, structured logging, health endpoint
 - **Full Docker Compose stack** — One-command startup
-- **Observability** — Structured logging, health endpoints, basic metrics
 - **Extensible** — Easy to add new sensor types or ML models
 
 ---
@@ -82,10 +83,9 @@ PortEdge shows you can:
 |--------------------|-------------------------------------|
 | Language           | Python 3.11+                        |
 | Messaging          | MQTT (Eclipse Mosquitto)            |
-| Edge Logic         | FastAPI + asyncio + scikit-learn    |
+| Edge Logic         | FastAPI + scikit-learn + threading  |
 | Dashboard          | Streamlit + Plotly                  |
 | Containerization   | Docker + Docker Compose             |
-| Data               | In-memory + optional SQLite         |
 | Protocols          | MQTT, HTTP/REST, WebSocket          |
 
 ---
@@ -103,10 +103,11 @@ docker compose up --build
 ```
 
 Services will be available at:
-- Edge Gateway API: http://localhost:8000
-- Dashboard: http://localhost:8501
-- MQTT Broker: localhost:1883
-- API Docs: http://localhost:8000/docs
+- **Dashboard**: http://localhost:8501
+- **Edge Gateway API**: http://localhost:8000
+- **API Docs (Swagger)**: http://localhost:8000/docs
+- **Health**: http://localhost:8000/health
+- **MQTT Broker**: localhost:1883
 
 ---
 
@@ -117,22 +118,21 @@ portedge/
 ├── README.md
 ├── docker-compose.yml
 ├── services/
-│   ├── edge-gateway/          # Core edge processing
+│   ├── edge-gateway/          # Core edge processing (v0.2)
 │   ├── sensor-simulator/      # Generates realistic sensor streams
 │   └── dashboard/             # Visualization & control
 ├── infrastructure/
 │   └── mosquitto/             # MQTT config
-├── docs/
-└── scripts/
+└── ...
 ```
 
 ---
 
 ## Computer Engineering Skills Demonstrated
 
-- Concurrent systems (asyncio, multi-producer/consumer)
-- Network protocols & reliability (MQTT QoS, reconnection)
-- Edge computing patterns (local inference, buffering, fail-over)
+- Concurrent systems & thread-safe shared state
+- Network protocols & reliability (MQTT QoS, automatic reconnection)
+- Edge computing patterns (local inference, buffering)
 - Real-time data pipelines
 - Systems design & modularity
 - Container orchestration basics
@@ -143,16 +143,14 @@ portedge/
 
 ## Roadmap / Iterations
 
-We will improve this project iteratively:
-
 1. ✅ Initial structure + core MQTT + edge gateway
-2. Robust anomaly detection + alerting
-3. Computer vision cargo inspection module
-4. Persistence layer + historical analytics
-5. Security (TLS MQTT, API auth)
-6. Performance testing & optimization
-7. Kubernetes manifests (optional)
-8. Full CI pipeline + tests
+2. ✅ Robust anomaly detection, thread-safety, reconnection (v0.2)
+3. ⬜ Computer vision cargo inspection module
+4. ⬜ Persistence layer + historical analytics
+5. ⬜ Security (TLS MQTT notes, API key auth)
+6. ⬜ Unit tests + GitHub Actions CI
+7. ⬜ Performance notes & load testing tips
+8. ⬜ Kubernetes manifests (optional)
 
 ---
 
